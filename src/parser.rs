@@ -15,7 +15,7 @@ use lexer::Element::{self, Expression, Tag, Raw};
 use error::{Error, Result};
 use std::slice::Iter;
 use std::collections::HashSet;
-use std::iter::FromIterator;
+use std::iter::{Peekable, FromIterator};
 
 /// Parses the provided elements into a number of Renderable items
 /// This is the internal version of parse that accepts Elements tokenized
@@ -74,10 +74,11 @@ pub fn parse_output(tokens: &[Token]) -> Result<Output> {
             }
         };
         let mut args = vec![];
+        let mut named_args = vec![];
 
         match iter.peek() {
             Some(&&Pipe) | None => {
-                filters.push(FilterPrototype::new(name, args));
+                filters.push(FilterPrototype::new(name, args, named_args));
                 continue;
             }
             _ => (),
@@ -85,35 +86,82 @@ pub fn parse_output(tokens: &[Token]) -> Result<Output> {
 
         try!(expect(&mut iter, &Colon));
 
-        // loops through the argument list after the filter name
-        while iter.peek() != None && iter.peek().unwrap() != &&Pipe {
-            match iter.next().unwrap() {
-                x @ &StringLiteral(_) |
-                x @ &NumberLiteral(_) |
-                x @ &BooleanLiteral(_) => args.push(Argument::Val(try!(Value::from_token(x)))),
-                &Identifier(ref v) => args.push(Argument::Var(Variable::new(v))),
-                x => {
-                    return Error::parser("a comma or a pipe", Some(x));
-                }
-            }
+        parse_filter_args(&mut iter, &mut args, &mut named_args)?;
 
-            // ensure that the next token is either a Comma or a Pipe
-            match iter.peek() {
-                Some(&&Comma) => {
-                    let _ = iter.next().unwrap();
-                    continue;
-                }
-                Some(&&Pipe) | None => break,
-                _ => {
-                    return Error::parser("a comma or a pipe", Some(iter.next().unwrap()));
-                }
-            }
-        }
-
-        filters.push(FilterPrototype::new(name, args));
+        filters.push(FilterPrototype::new(name, args, named_args));
     }
 
     Ok(Output::new(entry, filters))
+}
+
+fn parse_filter_args(iter: &mut Peekable<Iter<Token>>, args: &mut Vec<Argument>, named_args: &mut Vec<(String, Argument)>) -> Result<()> {
+    // loops through the argument list after the filter name
+    while has_next_filter_token(iter) {
+        match iter.next().unwrap() {
+            x @ &StringLiteral(_) |
+            x @ &NumberLiteral(_) |
+            x @ &BooleanLiteral(_) => args.push(Argument::Val(try!(Value::from_token(x)))),
+            &Identifier(ref v) => {
+                if let Some(&&Colon) = iter.peek() {
+                    // start parsing named arguments
+                    while let Some(_) = iter.peek() {
+                        match (iter.next(), iter.next()) {
+                            (Some(&Colon), Some(val)) => {
+                                let value = match val {
+                                    x @ &StringLiteral(_) |
+                                    x @ &NumberLiteral(_) |
+                                    x @ &BooleanLiteral(_) => Argument::Val(try!(Value::from_token(x))),
+                                    &Identifier(ref v) => { Argument::Var(Variable::new(v)) },
+                                    _ => return Error::parser("an identifier or a literal", Some(val))
+                                };
+                                named_args.push((v.to_owned(), value));
+                                if !has_next_filter_token(iter) { return Ok(()) }
+                                match iter.peek() {
+                                    Some(&&Comma) => {
+                                        let _ = iter.next().unwrap();
+                                    }
+                                    _ => {
+                                        return Error::parser("a comma or a pipe", Some(iter.next().unwrap()));
+                                    }
+                                }
+                            }
+                            (Some(&Colon), token) => {
+                                return Error::parser("an identifier or a value", token);
+                            }
+                            (not_colon, _) => {
+                                return Error::parser("a colon", not_colon);
+                            }
+                        }
+                    }
+                } else {
+                    args.push(Argument::Var(Variable::new(v)))
+                }
+            },
+            x => {
+                return Error::parser("a comma or a pipe", Some(x));
+            }
+        }
+
+        // ensure that the next token is either a Comma or a Pipe
+        match iter.peek() {
+            Some(&&Comma) => {
+                let _ = iter.next().unwrap();
+                continue;
+            }
+            Some(&&Pipe) | None => break,
+            _ => {
+                return Error::parser("a comma or a pipe", Some(iter.next().unwrap()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_next_filter_token(iter: &mut Peekable<Iter<Token>>) -> bool {
+    match iter.peek() {
+        None | Some(&&Pipe) => false,
+        _ => true,
+    }
 }
 
 // a tag can be either a single-element tag or a block, which can contain other
@@ -212,7 +260,7 @@ pub struct BlockSplit<'a> {
 /// when it finds a delimter at the top level of the token stream,
 /// ignoring any it finds in nested blocks.
 ///
-/// Returns a slice contaiing all elements before the delimiter, and
+/// Returns a slice containing all elements before the delimiter, and
 /// an optional `BlockSplit` struct describing the delimiter and
 /// trailing elements.
 pub fn split_block<'a>(tokens: &'a [Element],
@@ -263,7 +311,7 @@ mod test {
 
         #[test]
         fn parses_filters() {
-            let tokens = granularize("abc | def:'1',2,'3' | blabla").unwrap();
+            let tokens = granularize("abc | def:'1',2,'3',a:'b', b:'c' | blabla").unwrap();
 
             let result = parse_output(&tokens);
             assert_eq!(result.unwrap(),
@@ -273,8 +321,8 @@ mod test {
                                          Argument::Val(Value::str("1")),
                                          Argument::Val(Value::Num(2.0)),
                                          Argument::Val(Value::str("3")),
-                    ]),
-                                        FilterPrototype::new("blabla", vec![])]));
+                    ], vec![("a".to_string(), Argument::Val(Value::str("b"))), ("b".to_string(), Argument::Val(Value::str("c")))]),
+                                        FilterPrototype::new("blabla", vec![], vec![])]));
         }
 
         #[test]
@@ -293,6 +341,15 @@ mod test {
             let result = parse_output(&tokens);
             assert_eq!(result.unwrap_err().to_string(),
                        "Parsing error: Expected a comma or a pipe, found blabla");
+        }
+
+        #[test]
+        fn fails_on_positional_args_following_named_args() {
+            let tokens = granularize("abc | def:'1',a: blabla, 'a'").unwrap();
+
+            let result = parse_output(&tokens);
+            assert_eq!(result.unwrap_err().to_string(),
+            "Parsing error: Expected a comma, a pipe, or a colon, found blabla");
         }
 
         #[test]
